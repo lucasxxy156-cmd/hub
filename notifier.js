@@ -21,15 +21,23 @@ async function notifyNewChapter(manga) {
             message += `   👉 <a href="${s.url}">กดอ่านที่นี่</a>\n`;
         });
 
-        // ถ้ามีรูปปก ให้ส่งแบบรูปภาพพร้อม Caption
+        // พยายามส่งแบบรูปภาพก่อน ถ้า Telegram ดึงรูปจากเว็บต้นทางไม่ได้ ให้ fallback ส่งเป็นข้อความทันที
+        let sent = false;
         if (manga.cover && manga.cover.startsWith('http')) {
-            await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, {
-                chat_id: TELEGRAM_CHAT_ID,
-                photo: manga.cover,
-                caption: message,
-                parse_mode: 'HTML'
-            });
-        } else {
+            try {
+                await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+                    chat_id: TELEGRAM_CHAT_ID,
+                    photo: manga.cover,
+                    caption: message,
+                    parse_mode: 'HTML'
+                });
+                sent = true;
+            } catch (imgErr) {
+                console.warn(`[Notifier] Telegram cannot load image directly, falling back to text message...`);
+            }
+        }
+
+        if (!sent) {
             await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
                 chat_id: TELEGRAM_CHAT_ID,
                 text: message,
@@ -37,6 +45,7 @@ async function notifyNewChapter(manga) {
                 disable_web_page_preview: false
             });
         }
+
         console.log(`[Notifier] Telegram alert sent for: ${title}`);
     } catch (err) {
         console.error('[Notifier] Failed to send Telegram alert:', err.response?.data?.description || err.message);
