@@ -1,31 +1,69 @@
+require('dotenv').config();
 const axios = require('axios');
 
-const TELEGRAM_BOT_TOKEN = '9147165788:AAHImsnkY3pbVXkNxv9v5CDXr8sW5C-4K3Q';
-const TELEGRAM_CHAT_ID = '5836868707';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-/**
- * ส่งข้อความแจ้งเตือนมังงะตอนใหม่เข้า Telegram
- * @param {Object} manga - ข้อมูลมังงะที่มีตอนใหม่
- */
-async function notifyNewChapter(manga) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+const CAPTION_LIMIT = 1024; // ข้อจำกัดของ Telegram สำหรับ caption ใต้รูป
+const SEND_GAP_MS = 1100;   // Telegram จำกัด ~1 ข้อความ/วินาที ต่อแชท
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Telegram parse_mode HTML ต้อง escape & < > (และ " ในแอตทริบิวต์) ไม่งั้นได้ 400 แล้วแจ้งเตือนหาย
+function escapeHtml(s) {
+    return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+const isHttpUrl = (u) => typeof u === 'string' && /^https?:\/\//i.test(u);
+
+async function telegram(method, payload) {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
     try {
-        const title = manga.title || 'มังงะเรื่องใหม่';
-        let message = `⚡ <b>มังงะอัปเดตตอนใหม่!</b>\n\n`;
-        message += `📖 <b>${title}</b>\n\n`;
-        message += `🔗 <b>แหล่งอ่านที่อัปเดต:</b>\n`;
+        return await axios.post(url, payload, { timeout: 15000 });
+    } catch (err) {
+        // โดน rate limit: รอตามที่ Telegram บอกแล้วลองอีกครั้งเดียว
+        const retryAfter = err.response?.data?.parameters?.retry_after;
+        if (err.response?.status === 429 && retryAfter) {
+            await sleep((retryAfter + 1) * 1000);
+            return axios.post(url, payload, { timeout: 15000 });
+        }
+        throw err;
+    }
+}
 
-        manga.sources.forEach(s => {
-            message += `▪️ <b>${s.source}</b>: ${s.latestChapter}\n`;
-            message += `   👉 <a href="${s.url}">กดอ่านที่นี่</a>\n`;
-        });
+function buildMessage(manga, changedSources = []) {
+    const lines = [
+        '⚡ <b>มังงะอัปเดตตอนใหม่!</b>',
+        '',
+        `📖 <b>${escapeHtml(manga.title || 'มังงะเรื่องใหม่')}</b>`,
+        '',
+        '🔗 <b>แหล่งอ่านที่อัปเดต:</b>'
+    ];
 
-        // พยายามส่งแบบรูปภาพก่อน ถ้า Telegram ดึงรูปจากเว็บต้นทางไม่ได้ ให้ fallback ส่งเป็นข้อความทันที
+    for (const s of manga.sources) {
+        const mark = changedSources.includes(s.source) ? '🆕' : '▪️';
+        lines.push(`${mark} <b>${escapeHtml(s.source)}</b>: ${escapeHtml(s.latestChapter)}`);
+        if (isHttpUrl(s.url)) {
+            lines.push(`   👉 <a href="${escapeHtml(s.url)}">กดอ่านที่นี่</a>`);
+        }
+    }
+    return lines.join('\n');
+}
+
+async function send(manga, changedSources) {
+    const title = manga.title || 'มังงะเรื่องใหม่';
+    try {
+        const message = buildMessage(manga, changedSources);
+
+        // ลองส่งแบบมีรูปก่อน (ถ้า caption ไม่เกิน 1024) ถ้า Telegram ดึงรูปไม่ได้ให้ fallback เป็นข้อความ
         let sent = false;
-        if (manga.cover && manga.cover.startsWith('http')) {
+        if (isHttpUrl(manga.cover) && message.length <= CAPTION_LIMIT) {
             try {
-                await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+                await telegram('sendPhoto', {
                     chat_id: TELEGRAM_CHAT_ID,
                     photo: manga.cover,
                     caption: message,
@@ -33,16 +71,16 @@ async function notifyNewChapter(manga) {
                 });
                 sent = true;
             } catch (imgErr) {
-                console.warn(`[Notifier] Telegram cannot load image directly, falling back to text message...`);
+                console.warn('[Notifier] sendPhoto failed, falling back to text:',
+                    imgErr.response?.data?.description || imgErr.message);
             }
         }
 
         if (!sent) {
-            await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            await telegram('sendMessage', {
                 chat_id: TELEGRAM_CHAT_ID,
                 text: message,
-                parse_mode: 'HTML',
-                disable_web_page_preview: false
+                parse_mode: 'HTML'
             });
         }
 
@@ -52,6 +90,29 @@ async function notifyNewChapter(manga) {
     }
 }
 
+let warnedMissingConfig = false;
+let queue = Promise.resolve();
+
+/**
+ * ส่งแจ้งเตือนมังงะตอนใหม่เข้า Telegram — เข้าคิวและส่งทีละเรื่อง เว้นช่วงกัน rate limit
+ * @param {Object} manga - ข้อมูลมังงะที่มีตอนใหม่
+ * @param {string[]} changedSources - ชื่อเว็บที่ตอนเพิ่งเปลี่ยน (ใช้ติดไอคอน 🆕)
+ */
+function notifyNewChapter(manga, changedSources = []) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+        if (!warnedMissingConfig) {
+            console.warn('[Notifier] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set in .env — alerts disabled');
+            warnedMissingConfig = true;
+        }
+        return Promise.resolve();
+    }
+
+    queue = queue.then(() => send(manga, changedSources)).then(() => sleep(SEND_GAP_MS));
+    return queue;
+}
+
 module.exports = {
-    notifyNewChapter
+    notifyNewChapter,
+    escapeHtml,
+    buildMessage
 };
