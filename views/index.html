@@ -39,6 +39,8 @@
             -webkit-box-orient: vertical;
             overflow: hidden;
         }
+        .scrollbar-none { scrollbar-width: none; }
+        .scrollbar-none::-webkit-scrollbar { display: none; }
         @keyframes pulse-fast {
             0%, 100% { opacity: 1; transform: scale(1); }
             50% { opacity: 0.85; transform: scale(0.97); }
@@ -50,6 +52,7 @@
     <!-- Favicon & Touch Icon -->
     <link rel="icon" type="image/jpeg" href="/images/logo.jpg">
     <link rel="apple-touch-icon" href="/images/logo.jpg">
+    <!-- og:image ต้องเป็น URL เต็ม เช่น https://your-domain.com/images/logo.jpg ถึงจะขึ้นตอนแชร์ลิงก์ -->
     <meta property="og:image" content="/images/logo.jpg">
 </head>
 <body class="bg-[#0f172a] text-slate-100 min-h-screen flex flex-col">
@@ -70,14 +73,14 @@
             <!-- Search Bar -->
             <div class="flex-1 max-w-md mx-4">
                 <div class="relative">
-                    <input type="text" id="searchInput" placeholder="ค้นหาชื่อมังงะ..." 
+                    <input type="text" id="searchInput" placeholder="ค้นหาชื่อมังงะ..."
                         class="w-full bg-slate-900/80 border border-slate-700 rounded-full px-4 py-2 pl-10 text-sm text-slate-200 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 transition">
                     <i class="fa-solid fa-magnifying-glass absolute left-3.5 top-3 text-slate-400 text-xs"></i>
                 </div>
             </div>
 
             <div class="flex items-center space-x-2">
-                <button id="refreshBtn" class="flex items-center space-x-2 bg-purple-600 hover:bg-purple-700 text-white text-xs px-3.5 py-2 rounded-lg font-medium transition shadow-lg shadow-purple-600/20">
+                <button id="refreshBtn" class="flex items-center space-x-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-60 disabled:cursor-wait text-white text-xs px-3.5 py-2 rounded-lg font-medium transition shadow-lg shadow-purple-600/20">
                     <i class="fa-solid fa-arrows-rotate text-xs" id="refreshIcon"></i>
                     <span class="hidden sm:inline">รีเฟรช</span>
                 </button>
@@ -143,48 +146,113 @@
         <!-- Empty State -->
         <div id="emptyState" class="hidden flex-col items-center justify-center py-20 text-center">
             <i class="fa-solid fa-magnifying-glass text-slate-600 text-4xl mb-3"></i>
-            <h3 class="text-base font-semibold text-slate-300">ไม่พบมังงะที่คุณค้นหา</h3>
-            <p class="text-xs text-slate-500 mt-1">ลองเปลี่ยนคำค้นหา หรือเลือกฟิลเตอร์ทั้งหมด</p>
+            <h3 class="text-base font-semibold text-slate-300" id="emptyTitle">ไม่พบมังงะที่คุณค้นหา</h3>
+            <p class="text-xs text-slate-500 mt-1" id="emptyDesc">ลองเปลี่ยนคำค้นหา หรือเลือกฟิลเตอร์ทั้งหมด</p>
         </div>
     </main>
 
     <!-- Footer -->
     <footer class="border-t border-slate-800 py-6 text-center text-xs text-slate-500">
-        <p>MangaHub • ระบบรวมฟีดมังงะแปลไทย เปรียบเทียบตอนอัปเดตแบบเรียลไทม์</p>
+        <p>MangaHub • ระบบรวมฟีดมังงะแปลไทย เปรียบเทียบตอนอัปเดตอัตโนมัติทุก 5 นาที</p>
     </footer>
 
     <!-- App Logic -->
     <script>
+        const AUTO_REFRESH_MS = 5 * 60 * 1000;
+        const EMPTY_DEFAULT = { title: 'ไม่พบมังงะที่คุณค้นหา', desc: 'ลองเปลี่ยนคำค้นหา หรือเลือกฟิลเตอร์ทั้งหมด' };
+
+        // รูปสำรองแบบ inline (ไม่พึ่งเว็บภายนอก)
+        const PLACEHOLDER_IMG = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="400" viewBox="0 0 300 400">' +
+            '<rect width="300" height="400" fill="#1e293b"/>' +
+            '<text x="150" y="205" font-family="sans-serif" font-size="18" fill="#94a3b8" text-anchor="middle">No Cover</text></svg>'
+        );
+
         let allManga = [];
         let currentFilter = 'all';
+        let isLoading = false;
 
-        async function fetchMangaData() {
+        // ป้องกัน XSS / attribute พัง: ข้อมูลทั้งหมดมาจากการ scrape เว็บภายนอก ห้ามเชื่อถือ
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // อนุญาตเฉพาะลิงก์ http(s) (กัน javascript: ฯลฯ)
+        function safeUrl(url) {
+            return /^https?:\/\//i.test(String(url || '')) ? url : '';
+        }
+
+        function safeColor(color) {
+            return /^#[0-9a-f]{3,8}$/i.test(String(color || '')) ? color : '#a855f7';
+        }
+
+        function setEmptyMessage(title, desc) {
+            document.getElementById('emptyTitle').innerText = title;
+            document.getElementById('emptyDesc').innerText = desc;
+        }
+
+        function setStatus(text, isError = false) {
+            const el = document.getElementById('lastUpdatedTime');
+            el.innerText = text;
+            el.classList.toggle('text-rose-400', isError);
+            el.classList.toggle('text-slate-400', !isError);
+        }
+
+        // force = true → POST /api/refresh (สั่งดึงเว็บต้นทางใหม่จริงๆ), silent = true → ไม่โชว์ตัวโหลด
+        async function fetchMangaData({ force = false, silent = false } = {}) {
+            if (isLoading) return;
+            isLoading = true;
+
             const loading = document.getElementById('loading');
-            const grid = document.getElementById('mangaGrid');
+            const refreshBtn = document.getElementById('refreshBtn');
             const refreshIcon = document.getElementById('refreshIcon');
+            const firstLoad = allManga.length === 0;
 
-            loading.classList.remove('hidden');
-            grid.classList.add('hidden');
-            refreshIcon.classList.add('animate-spin');
+            if (!silent) {
+                refreshIcon.classList.add('animate-spin');
+                refreshBtn.disabled = true;
+                if (firstLoad) {
+                    loading.classList.remove('hidden');
+                    document.getElementById('mangaGrid').classList.add('hidden');
+                }
+            }
 
             try {
-                const res = await fetch('/api/manga');
-                const data = await res.json();
-                allManga = data.data || [];
-                document.getElementById('totalCount').innerText = allManga.length;
-                
-                // นับจำนวนเรื่องที่อัปเดตวันนี้
-                const todayTotal = allManga.filter(m => m.isNewToday).length;
-                document.getElementById('todayCount').innerText = todayTotal;
+                const res = await fetch(force ? '/api/refresh' : '/api/manga', { method: force ? 'POST' : 'GET' });
+                if (!res.ok) throw new Error('เซิร์ฟเวอร์ตอบกลับ HTTP ' + res.status);
+                const json = await res.json();
 
-                document.getElementById('lastUpdatedTime').innerText = 'อัปเดตล่าสุด: ' + new Date(data.updatedAt).toLocaleTimeString('th-TH');
+                allManga = Array.isArray(json.data) ? json.data : [];
+                document.getElementById('totalCount').innerText = allManga.length;
+                document.getElementById('todayCount').innerText = allManga.filter(m => m.isNewToday).length;
+
+                if (json.updatedAt) {
+                    let text = 'อัปเดตล่าสุด: ' + new Date(json.updatedAt).toLocaleTimeString('th-TH');
+                    if (force && json.refreshed === false) text += ' (เพิ่งอัปเดตไป ใช้ข้อมูลล่าสุด)';
+                    setStatus(text);
+                } else {
+                    setStatus('ยังไม่มีข้อมูล — เว็บต้นทางอาจยังไม่ตอบสนอง ลองรีเฟรชอีกครั้ง', true);
+                }
+
+                setEmptyMessage(EMPTY_DEFAULT.title, EMPTY_DEFAULT.desc);
                 renderManga();
             } catch (err) {
-                alert('ไม่สามารถโหลดข้อมูลได้: ' + err.message);
+                // ถ้ามีข้อมูลเดิมอยู่แล้วให้คงไว้ แล้วแจ้งสถานะแทนการเด้ง alert
+                setStatus('โหลดข้อมูลไม่สำเร็จ: ' + err.message, true);
+                if (allManga.length === 0) {
+                    setEmptyMessage('โหลดข้อมูลไม่สำเร็จ', 'ตรวจสอบว่าเซิร์ฟเวอร์ทำงานอยู่ แล้วกดรีเฟรชอีกครั้ง');
+                    renderManga();
+                }
             } finally {
+                isLoading = false;
                 loading.classList.add('hidden');
-                grid.classList.remove('hidden');
                 refreshIcon.classList.remove('animate-spin');
+                refreshBtn.disabled = false;
             }
         }
 
@@ -193,8 +261,8 @@
             const empty = document.getElementById('emptyState');
             const query = document.getElementById('searchInput').value.toLowerCase().trim();
 
-            let filtered = allManga.filter(item => {
-                const matchQuery = !query || item.title.toLowerCase().includes(query);
+            const filtered = allManga.filter(item => {
+                const matchQuery = !query || String(item.title || '').toLowerCase().includes(query);
                 if (!matchQuery) return false;
 
                 if (currentFilter === 'all') return true;
@@ -217,17 +285,19 @@
             grid.innerHTML = filtered.map(item => {
                 const hasMultiple = item.sources.length > 1;
                 const isNew = item.isNewToday;
+                const title = escapeHtml(item.title);
+                const cover = escapeHtml(safeUrl(item.cover) || PLACEHOLDER_IMG);
 
                 return `
                 <div class="bg-slate-900/90 border ${isNew ? 'border-rose-500/40 shadow-rose-950/20' : 'border-slate-800'} hover:border-purple-500/50 rounded-xl overflow-hidden shadow-lg transition duration-200 flex flex-col group hover:-translate-y-1 relative">
-                    
+
                     <div class="relative aspect-[3/4] bg-slate-950 overflow-hidden">
-                        <img src="${item.cover || 'https://via.placeholder.com/300x400?text=No+Cover'}" 
-                             alt="${item.title}" 
-                             loading="lazy" 
-                             class="w-full h-full object-cover group-hover:scale-105 transition duration-300"
-                             onerror="this.src='https://placehold.co/300x400/1e293b/cbd5e1?text=No+Image'">
-                        
+                        <img src="${cover}"
+                             alt="${title}"
+                             loading="lazy"
+                             referrerpolicy="no-referrer"
+                             class="w-full h-full object-cover group-hover:scale-105 transition duration-300">
+
                         <!-- ป้าย NEW อัปเดตวันนี้ (มุมซ้ายบน) -->
                         ${isNew ? `
                             <span class="absolute top-2 left-2 bg-gradient-to-r from-red-600 to-rose-500 text-white text-[10px] px-2 py-0.5 rounded-md font-extrabold shadow-lg shadow-red-500/50 flex items-center space-x-1 animate-pulse-fast">
@@ -246,26 +316,28 @@
 
                     <div class="p-3 flex-1 flex flex-col justify-between">
                         <div>
-                            <h2 class="text-sm font-semibold text-slate-100 line-clamp-2" title="${item.title}">
-                                ${item.title}
+                            <h2 class="text-sm font-semibold text-slate-100 line-clamp-2" title="${title}">
+                                ${title}
                             </h2>
                         </div>
 
                         <!-- Source Links with Chapter badges -->
                         <div class="mt-3 space-y-1.5 pt-2 border-t border-slate-800">
-                            ${item.sources.map(s => `
-                                <a href="${s.url}" target="_blank" rel="noopener noreferrer" 
-                                   class="flex items-center justify-between px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs transition group/link">
-                                    <span class="font-medium text-[11px] truncate flex items-center" style="color: ${s.sourceColor}">
-                                        ${s.source}
+                            ${item.sources.map(s => {
+                                const chapter = escapeHtml(s.latestChapter);
+                                return `
+                                <a href="${escapeHtml(safeUrl(s.url) || '#')}" target="_blank" rel="noopener noreferrer"
+                                   class="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs transition group/link">
+                                    <span class="font-medium text-[11px] truncate flex items-center" style="color: ${safeColor(s.sourceColor)}">
+                                        ${escapeHtml(s.source)}
                                     </span>
-                                    <div class="flex items-center space-x-1">
-                                        <span class="text-[10px] bg-slate-900 text-slate-300 px-1.5 py-0.5 rounded font-mono border border-slate-700/60 group-hover/link:text-purple-300">
-                                            ${s.latestChapter.length > 15 ? s.latestChapter.substring(0, 15) : s.latestChapter}
+                                    <div class="flex items-center space-x-1 min-w-0">
+                                        <span class="text-[10px] bg-slate-900 text-slate-300 px-1.5 py-0.5 rounded font-mono border border-slate-700/60 group-hover/link:text-purple-300 truncate max-w-[90px]" title="${chapter}">
+                                            ${chapter}
                                         </span>
                                     </div>
-                                </a>
-                            `).join('')}
+                                </a>`;
+                            }).join('')}
                         </div>
                     </div>
                 </div>
@@ -273,12 +345,25 @@
             }).join('');
         }
 
-        // Search event
-        document.getElementById('searchInput').addEventListener('input', renderManga);
+        // รูปโหลดไม่ขึ้น → ใช้รูปสำรองครั้งเดียว (event error ไม่ bubble จึงต้องฟังแบบ capture)
+        document.getElementById('mangaGrid').addEventListener('error', (e) => {
+            const img = e.target;
+            if (img.tagName === 'IMG' && !img.dataset.fallback) {
+                img.dataset.fallback = '1';
+                img.src = PLACEHOLDER_IMG;
+            }
+        }, true);
 
-        // Refresh button
+        // Search event (debounce เล็กน้อยกันเรนเดอร์ถี่ตอนพิมพ์)
+        let searchTimer;
+        document.getElementById('searchInput').addEventListener('input', () => {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(renderManga, 150);
+        });
+
+        // Refresh button → บังคับดึงข้อมูลใหม่จากเว็บต้นทางจริงๆ
         document.getElementById('refreshBtn').addEventListener('click', () => {
-            fetchMangaData();
+            fetchMangaData({ force: true });
         });
 
         // Filter buttons
@@ -299,8 +384,11 @@
             });
         });
 
-        // Initial Load
+        // Initial Load + โหลดข้อมูลใหม่เงียบๆ ทุก 5 นาที (เฉพาะตอนเปิดหน้านี้อยู่)
         fetchMangaData();
+        setInterval(() => {
+            if (!document.hidden) fetchMangaData({ silent: true });
+        }, AUTO_REFRESH_MS);
     </script>
 </body>
 </html>
